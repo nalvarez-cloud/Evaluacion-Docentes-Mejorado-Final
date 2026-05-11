@@ -10,6 +10,7 @@ from nltk.corpus import stopwords
 from collections import Counter
 from pysentimiento import create_analyzer
 import google.generativeai as genai
+from ftfy import fix_text
 
 nltk.download("stopwords", quiet=True)
 
@@ -39,7 +40,15 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-analyzer = cargar_robertuito()
+try:
+    analyzer = cargar_robertuito()
+except Exception as e:
+    st.error("No se pudo cargar RoBERTuito. Revisa requirements.txt o la conexión del despliegue.")
+    st.exception(e)
+    st.stop()
+
+# Gemini desde Streamlit Secrets. No se solicita al usuario en pantalla.
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", None)
 
 # =========================
 # CONFIGURACIÓN
@@ -64,7 +73,7 @@ TEMAS_PEDAGOGICOS = {
     "Claridad y explicación": ["explica", "explicación", "claro", "claridad", "entiende", "entender", "comprensión", "dudas", "confuso", "confusa"],
     "Ejercicios prácticos": ["ejercicio", "ejercicios", "práctica", "practica", "práctico", "practico", "casos", "ejemplos", "aplicación", "aplicar"],
     "Retroalimentación": ["retroalimentación", "feedback", "corrección", "corregir", "calificación", "califica", "comentarios", "devolución"],
-    "Acompañamiento individual": ["individual", "personalizada", "personalizado", "tutoría", "tutoria", "acompañamiento", "asesoría", "asesoria", "uno a uno"],
+    "Acompañamiento individual": ["individual", "personalizada", "personalizado", "tutoría", "tutoria", "acompañamiento", "asesoría", "asesoria", "uno a uno", "individuales"],
     "Metodología": ["metodología", "metodologia", "dinámica", "dinamica", "didáctica", "didactica", "participación", "participacion", "grupo", "grupal"],
     "Ritmo y tiempo": ["rápido", "rapido", "lento", "tiempo", "ritmo", "apresurado", "demora", "plazo", "entrega"],
     "Plataforma y recursos": ["plataforma", "aula", "virtual", "material", "diapositiva", "diapositivas", "recurso", "recursos", "contenido", "contenidos"],
@@ -76,7 +85,8 @@ TEMAS_PEDAGOGICOS = {
 def limpiar_texto(texto):
     if pd.isna(texto):
         return ""
-    texto = str(texto).replace("Â", " ").replace("\xa0", " ").lower().strip()
+    texto = fix_text(str(texto))
+    texto = texto.replace("Â", " ").replace("\xa0", " ").lower().strip()
     texto = re.sub(r"[^a-záéíóúñü\s]", " ", texto)
     texto = re.sub(r"\s+", " ", texto).strip()
     return texto
@@ -97,7 +107,7 @@ def analizar_sentimiento_robertuito(texto):
     try:
         pred = analyzer.predict(texto)
         mapa = {"POS": "Positivo", "NEU": "Neutro", "NEG": "Negativo"}
-        return mapa.get(pred.output, "Neutro"), pred.probas[pred.output]
+        return mapa.get(pred.output, "Neutro"), float(pred.probas[pred.output])
     except Exception:
         return "Neutro", 0.0
 
@@ -106,7 +116,7 @@ def leer_csv_robusto(archivo):
     for enc in ["utf-8", "utf-8-sig", "latin-1", "cp1252"]:
         try:
             archivo.seek(0)
-            return pd.read_csv(archivo, encoding=enc)
+            return pd.read_csv(archivo, encoding=enc, sep=None, engine="python")
         except Exception:
             continue
     archivo.seek(0)
@@ -128,16 +138,45 @@ def resumen_temas(df):
         temas.extend(lista)
     return pd.DataFrame(Counter(temas).most_common(), columns=["Tema pedagógico", "Frecuencia"])
 
+
+def obtener_prediccion_y_confianza(modelo, textos):
+    """Devuelve predicción del modelo propio y confianza. Si el modelo fue calibrado usa predict_proba; si no, usa margen SVM normalizado."""
+    pred = modelo.predict(textos)
+    clases = list(getattr(modelo, "classes_", []))
+    if not clases and hasattr(modelo, "named_steps") and "modelo" in modelo.named_steps:
+        clases = list(getattr(modelo.named_steps["modelo"], "classes_", []))
+
+    if hasattr(modelo, "predict_proba"):
+        proba = modelo.predict_proba(textos)
+        conf = proba.max(axis=1)
+        return pred, conf
+
+    if hasattr(modelo, "decision_function"):
+        scores = modelo.decision_function(textos)
+        scores = np.asarray(scores)
+        if scores.ndim == 1:
+            # Caso binario. Se convierte el margen a pseudo-probabilidad.
+            conf = 1 / (1 + np.exp(-np.abs(scores)))
+        else:
+            # Softmax sobre márgenes para aproximar confianza cuando el SVM no está calibrado.
+            scores = scores - scores.max(axis=1, keepdims=True)
+            exp_scores = np.exp(scores)
+            probs = exp_scores / exp_scores.sum(axis=1, keepdims=True)
+            conf = probs.max(axis=1)
+        return pred, conf
+
+    return pred, np.repeat(np.nan, len(textos))
+
 # =========================
 # ENTRADA
 # =========================
 archivo = st.sidebar.file_uploader("Sube la evaluación del docente", type=["csv"])
-api_key = st.sidebar.text_input("Gemini API Key opcional", type="password")
 
 st.sidebar.markdown("---")
 st.sidebar.write("**Modelo principal:** SVM Lineal + TF-IDF")
 st.sidebar.write("**Entrenamiento:** etiquetas humanas")
 st.sidebar.write("**Benchmark:** RoBERTuito")
+st.sidebar.write("**Gemini:** automático con Streamlit Secrets" if GEMINI_API_KEY else "**Gemini:** no configurado en Secrets")
 
 if archivo is None:
     st.info("Sube un archivo CSV de evaluación docente para iniciar el análisis.")
@@ -275,7 +314,9 @@ if comentarios_validos == 0:
 st.subheader("4. Análisis de percepción con modelo propio")
 st.write("El modelo principal del sistema es un clasificador SVM Lineal con representación TF-IDF, entrenado con etiquetas humanas. Este modelo es el encargado de evaluar la percepción estudiantil en los comentarios.")
 
-df_re["percepcion_modelo"] = modelo.predict(df_re["comentario_limpio"])
+pred_svm, conf_svm = obtener_prediccion_y_confianza(modelo, df_re["comentario_limpio"])
+df_re["percepcion_modelo"] = pred_svm
+df_re["confianza_modelo_svm"] = conf_svm
 
 conteo_modelo = df_re["percepcion_modelo"].value_counts()
 fig, ax = plt.subplots(figsize=(7, 4))
@@ -287,7 +328,8 @@ st.pyplot(fig)
 
 predominante = conteo_modelo.idxmax()
 porcentaje_predominante = conteo_modelo.max() / conteo_modelo.sum() * 100
-st.info(f"La percepción predominante según el modelo propio es **{predominante}** con **{porcentaje_predominante:.1f}%** de los comentarios válidos.")
+conf_media_svm = np.nanmean(df_re["confianza_modelo_svm"]) * 100
+st.info(f"La percepción predominante según el modelo propio es **{predominante}** con **{porcentaje_predominante:.1f}%** de los comentarios válidos. La confianza promedio del modelo propio es **{conf_media_svm:.1f}%**.")
 
 # =========================
 # 5. ROBERTUITO BENCHMARK
@@ -308,7 +350,12 @@ st.pyplot(fig2)
 
 coinciden = (df_re["percepcion_modelo"] == df_re["sentimiento_robertuito"]).sum()
 concordancia = coinciden / len(df_re) * 100
-st.metric("Concordancia modelo propio vs RoBERTuito", f"{concordancia:.1f}%")
+conf_media_robertuito = df_re["confianza_robertuito"].mean() * 100
+m1, m2, m3 = st.columns(3)
+m1.metric("Concordancia SVM vs RoBERTuito", f"{concordancia:.1f}%")
+m2.metric("Confianza promedio SVM", f"{conf_media_svm:.1f}%")
+m3.metric("Confianza promedio RoBERTuito", f"{conf_media_robertuito:.1f}%")
+st.info("La confianza SVM corresponde al modelo propio desarrollado con etiquetas humanas. La confianza RoBERTuito corresponde al modelo externo usado como benchmark. En caso de discrepancias, se recomienda revisión humana del comentario.")
 
 # =========================
 # 6. TEMAS PEDAGÓGICOS
@@ -354,16 +401,19 @@ st.subheader("8. Comentarios que requieren revisión")
 df_alerta = df_re[(df_re["percepcion_modelo"] == "Negativo") | (df_re["sentimiento_robertuito"] == "Negativo") | (df_re["temas_mejora"].apply(len) > 0)].copy()
 
 if not df_alerta.empty:
-    df_mostrar = df_alerta[[COL_RESPUESTA, "percepcion_modelo", "sentimiento_robertuito", "temas_mejora", "confianza_robertuito"]].head(15).copy()
+    df_mostrar = df_alerta[[COL_RESPUESTA, "percepcion_modelo", "confianza_modelo_svm", "sentimiento_robertuito", "confianza_robertuito", "temas_mejora"]].head(15).copy()
+    df_mostrar["confianza_modelo_svm"] = (df_mostrar["confianza_modelo_svm"] * 100).round(1).astype(str) + "%"
+    df_mostrar["confianza_robertuito"] = (df_mostrar["confianza_robertuito"] * 100).round(1).astype(str) + "%"
     df_mostrar = df_mostrar.rename(columns={
         COL_RESPUESTA: "Comentario original",
         "percepcion_modelo": "Clasificación SVM",
+        "confianza_modelo_svm": "Confianza SVM",
         "sentimiento_robertuito": "Benchmark RoBERTuito",
-        "temas_mejora": "Temas pedagógicos detectados",
-        "confianza_robertuito": "Confianza RoBERTuito"
+        "confianza_robertuito": "Confianza RoBERTuito",
+        "temas_mejora": "Temas pedagógicos detectados"
     })
     st.dataframe(df_mostrar, use_container_width=True)
-    st.info("Estos comentarios requieren revisión porque contienen señales de inconformidad, dificultad de comprensión o temas pedagógicos accionables. No constituyen una decisión automática.")
+    st.info("Estos comentarios requieren revisión porque contienen señales de inconformidad, dificultad de comprensión o temas pedagógicos accionables. La clasificación SVM es la salida del modelo principal; RoBERTuito funciona como contraste externo. No constituyen una decisión automática.")
 else:
     st.success("No se detectaron comentarios prioritarios según el modelo y la capa pedagógica.")
 
@@ -395,6 +445,7 @@ st.markdown(f"""
 - Percepción positiva según modelo propio: **{porc_pos:.1f}%**
 - Percepción neutra según modelo propio: **{porc_neu:.1f}%**
 - Percepción negativa según modelo propio: **{porc_neg:.1f}%**
+- Confianza promedio del modelo propio SVM: **{conf_media_svm:.1f}%**
 - Concordancia con RoBERTuito: **{concordancia:.1f}%**
 - Temas pedagógicos principales: **{', '.join(temas_principales) if temas_principales else 'No disponible'}**
 - Nivel de alerta académica: **{nivel_alerta}**
@@ -408,9 +459,9 @@ st.markdown(f"""
 # =========================
 st.subheader("10. Recomendaciones con Gemini")
 
-if api_key:
+if GEMINI_API_KEY:
     try:
-        genai.configure(api_key=api_key)
+        genai.configure(api_key=GEMINI_API_KEY)
         modelos_disponibles = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-flash-latest", "gemini-pro-latest"]
         prompt = f"""
 Actúa como experto en evaluación docente, analítica educativa y mejora académica.
@@ -423,6 +474,8 @@ Resultados del análisis:
 - Percepción positiva modelo propio: {porc_pos:.1f}%
 - Percepción neutra modelo propio: {porc_neu:.1f}%
 - Percepción negativa modelo propio: {porc_neg:.1f}%
+- Confianza promedio SVM: {conf_media_svm:.1f}%
+- Confianza promedio RoBERTuito: {conf_media_robertuito:.1f}%
 - Concordancia con RoBERTuito: {concordancia:.1f}%
 - Nivel de alerta: {nivel_alerta}
 - Temas pedagógicos detectados: {df_temas.head(10).to_dict(orient='records') if not df_temas.empty else []}
@@ -459,7 +512,7 @@ Usa lenguaje profesional, orientado a mejora continua y evita tono punitivo.
     except Exception as e:
         st.error(f"Error general con Gemini: {e}")
 else:
-    st.warning("Agrega tu Gemini API Key en la barra lateral si deseas generar recomendaciones automáticas.")
+    st.info("Gemini no está configurado en Streamlit Secrets. La app funciona sin recomendaciones generativas automáticas.")
 
 # =========================
 # 11. DESCARGA
