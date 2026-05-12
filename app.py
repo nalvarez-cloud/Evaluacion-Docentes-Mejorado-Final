@@ -81,6 +81,21 @@ TEMAS_PEDAGOGICOS = {
     "Evaluación": ["evaluación", "evaluacion", "examen", "prueba", "tarea", "trabajo", "rúbrica", "rubrica", "nota", "calificar"]
 }
 
+# Patrones críticos: capa complementaria de seguridad interpretativa.
+# No reemplaza al modelo SVM; ayuda a marcar comentarios que requieren revisión humana.
+PATRONES_CRITICOS = [
+    "no explica", "no se entiende", "no entiendo", "no responde", "no resuelve",
+    "no domina", "no sabe", "solo lee", "lee diapositivas", "mala metodología",
+    "mala metodologia", "desorganizado", "desorganizada", "muy rápido", "muy rapido",
+    "va rápido", "va rapido", "califica por caras", "no retroalimenta",
+    "sin retroalimentación", "sin retroalimentacion", "poca práctica", "poca practica",
+    "falta práctica", "falta practica", "no es claro", "no es clara", "confuso",
+    "confusa", "no aclara", "no aclara dudas", "no ayuda", "poco claro", "poco clara",
+    "no contesta", "no responde dudas", "no hay retroalimentación", "no hay retroalimentacion",
+    "no da ejemplos", "no hace ejercicios", "no realiza ejercicios", "se demora en responder",
+    "no cumple", "no cumple horarios", "injusto", "injusta", "favoritismo"
+]
+
 
 def limpiar_texto(texto):
     if pd.isna(texto):
@@ -130,6 +145,32 @@ def detectar_temas(texto):
         if any(clave in texto for clave in claves):
             encontrados.append(tema)
     return encontrados
+
+
+def detectar_senal_critica(texto):
+    """Detecta frases críticas que pueden requerir revisión académica aunque el modelo clasifique positivo."""
+    texto = limpiar_texto(texto)
+    return any(patron in texto for patron in PATRONES_CRITICOS)
+
+
+def decision_final(row):
+    """Combina modelo SVM, señales críticas, benchmark RoBERTuito y confianza para una decisión interpretativa."""
+    if row["percepcion_modelo"] == "Negativo":
+        return "Negativo"
+
+    if row.get("senal_critica", False):
+        return "Revisión académica"
+
+    if (
+        row.get("percepcion_modelo") == "Positivo"
+        and row.get("sentimiento_robertuito") == "Negativo"
+    ):
+        return "Revisión académica"
+
+    if pd.notna(row.get("confianza_modelo_svm")) and row.get("confianza_modelo_svm") < 0.60:
+        return "Revisión por baja confianza"
+
+    return row["percepcion_modelo"]
 
 
 def resumen_temas(df):
@@ -317,6 +358,7 @@ st.write("El modelo principal del sistema es un clasificador SVM Lineal con repr
 pred_svm, conf_svm = obtener_prediccion_y_confianza(modelo, df_re["comentario_limpio"])
 df_re["percepcion_modelo"] = pred_svm
 df_re["confianza_modelo_svm"] = conf_svm
+df_re["senal_critica"] = df_re["comentario_limpio"].apply(detectar_senal_critica)
 
 conteo_modelo = df_re["percepcion_modelo"].value_counts()
 fig, ax = plt.subplots(figsize=(7, 4))
@@ -340,6 +382,7 @@ st.write("RoBERTuito se utiliza como benchmark externo de análisis de sentimien
 resultados_robertuito = df_re["comentario_limpio"].apply(analizar_sentimiento_robertuito)
 df_re["sentimiento_robertuito"] = [r[0] for r in resultados_robertuito]
 df_re["confianza_robertuito"] = [r[1] for r in resultados_robertuito]
+df_re["decision_final"] = df_re.apply(decision_final, axis=1)
 
 fig2, ax2 = plt.subplots(figsize=(7, 4))
 sns.countplot(data=df_re, x="sentimiento_robertuito", order=["Positivo", "Neutro", "Negativo"], ax=ax2)
@@ -356,6 +399,8 @@ m1.metric("Concordancia SVM vs RoBERTuito", f"{concordancia:.1f}%")
 m2.metric("Confianza promedio SVM", f"{conf_media_svm:.1f}%")
 m3.metric("Confianza promedio RoBERTuito", f"{conf_media_robertuito:.1f}%")
 st.info("La confianza SVM corresponde al modelo propio desarrollado con etiquetas humanas. La confianza RoBERTuito corresponde al modelo externo usado como benchmark. En caso de discrepancias, se recomienda revisión humana del comentario.")
+
+st.info("La **decisión final del sistema** combina la clasificación SVM, la confianza del modelo, la comparación con RoBERTuito y una capa de señales críticas pedagógicas. Esta decisión final no reemplaza la revisión humana; ayuda a priorizar comentarios que requieren análisis académico.")
 
 # =========================
 # 6. TEMAS PEDAGÓGICOS
@@ -398,22 +443,37 @@ else:
 # 8. COMENTARIOS ALERTA
 # =========================
 st.subheader("8. Comentarios que requieren revisión")
-df_alerta = df_re[(df_re["percepcion_modelo"] == "Negativo") | (df_re["sentimiento_robertuito"] == "Negativo") | (df_re["temas_mejora"].apply(len) > 0)].copy()
+df_alerta = df_re[
+    (df_re["decision_final"].isin(["Negativo", "Revisión académica", "Revisión por baja confianza"]))
+    | (df_re["sentimiento_robertuito"] == "Negativo")
+    | (df_re["temas_mejora"].apply(len) > 0)
+].copy()
 
 if not df_alerta.empty:
-    df_mostrar = df_alerta[[COL_RESPUESTA, "percepcion_modelo", "confianza_modelo_svm", "sentimiento_robertuito", "confianza_robertuito", "temas_mejora"]].head(15).copy()
+    df_mostrar = df_alerta[[
+        COL_RESPUESTA,
+        "percepcion_modelo",
+        "decision_final",
+        "senal_critica",
+        "confianza_modelo_svm",
+        "sentimiento_robertuito",
+        "confianza_robertuito",
+        "temas_mejora"
+    ]].head(15).copy()
     df_mostrar["confianza_modelo_svm"] = (df_mostrar["confianza_modelo_svm"] * 100).round(1).astype(str) + "%"
     df_mostrar["confianza_robertuito"] = (df_mostrar["confianza_robertuito"] * 100).round(1).astype(str) + "%"
     df_mostrar = df_mostrar.rename(columns={
         COL_RESPUESTA: "Comentario original",
         "percepcion_modelo": "Clasificación SVM",
+        "decision_final": "Decisión final del sistema",
+        "senal_critica": "Señal crítica detectada",
         "confianza_modelo_svm": "Confianza SVM",
         "sentimiento_robertuito": "Benchmark RoBERTuito",
         "confianza_robertuito": "Confianza RoBERTuito",
         "temas_mejora": "Temas pedagógicos detectados"
     })
     st.dataframe(df_mostrar, use_container_width=True)
-    st.info("Estos comentarios requieren revisión porque contienen señales de inconformidad, dificultad de comprensión o temas pedagógicos accionables. La clasificación SVM es la salida del modelo principal; RoBERTuito funciona como contraste externo. No constituyen una decisión automática.")
+    st.info("Estos comentarios requieren revisión porque contienen señales de inconformidad, baja confianza, discrepancias entre modelos o temas pedagógicos accionables. La clasificación SVM es la salida del modelo principal; la decisión final agrega una capa de seguridad interpretativa. No constituye una decisión automática.")
 else:
     st.success("No se detectaron comentarios prioritarios según el modelo y la capa pedagógica.")
 
@@ -424,11 +484,13 @@ st.subheader("9. Diagnóstico interpretativo")
 porc_neg = (df_re["percepcion_modelo"].eq("Negativo").mean() * 100)
 porc_neu = (df_re["percepcion_modelo"].eq("Neutro").mean() * 100)
 porc_pos = (df_re["percepcion_modelo"].eq("Positivo").mean() * 100)
+porc_revision = (df_re["decision_final"].isin(["Revisión académica", "Revisión por baja confianza"]).mean() * 100)
+porc_neg_final = (df_re["decision_final"].eq("Negativo").mean() * 100)
 
-if porc_neg >= 30:
+if porc_neg_final >= 30 or porc_revision >= 30:
     nivel_alerta = "Alto"
     interpretacion = "Se recomienda revisión académica prioritaria y acompañamiento docente."
-elif porc_neg >= 15 or porc_neu >= 40:
+elif porc_neg_final >= 15 or porc_neu >= 40 or porc_revision >= 15:
     nivel_alerta = "Medio"
     interpretacion = "Se recomienda acompañamiento pedagógico y seguimiento en la siguiente evaluación."
 else:
@@ -445,6 +507,7 @@ st.markdown(f"""
 - Percepción positiva según modelo propio: **{porc_pos:.1f}%**
 - Percepción neutra según modelo propio: **{porc_neu:.1f}%**
 - Percepción negativa según modelo propio: **{porc_neg:.1f}%**
+- Comentarios marcados para revisión por decisión final: **{porc_revision:.1f}%**
 - Confianza promedio del modelo propio SVM: **{conf_media_svm:.1f}%**
 - Concordancia con RoBERTuito: **{concordancia:.1f}%**
 - Temas pedagógicos principales: **{', '.join(temas_principales) if temas_principales else 'No disponible'}**
@@ -474,6 +537,7 @@ Resultados del análisis:
 - Percepción positiva modelo propio: {porc_pos:.1f}%
 - Percepción neutra modelo propio: {porc_neu:.1f}%
 - Percepción negativa modelo propio: {porc_neg:.1f}%
+- Comentarios marcados para revisión por decisión final: {porc_revision:.1f}%
 - Confianza promedio SVM: {conf_media_svm:.1f}%
 - Confianza promedio RoBERTuito: {conf_media_robertuito:.1f}%
 - Concordancia con RoBERTuito: {concordancia:.1f}%
@@ -481,6 +545,7 @@ Resultados del análisis:
 - Temas pedagógicos detectados: {df_temas.head(10).to_dict(orient='records') if not df_temas.empty else []}
 - Palabras frecuentes: {df_palabras.head(10).to_dict(orient='records') if not df_palabras.empty else []}
 - Comentarios prioritarios: {df_alerta[COL_RESPUESTA].head(5).tolist() if not df_alerta.empty else []}
+- Señales críticas detectadas: {int(df_re['senal_critica'].sum())}
 
 Genera:
 1. Resumen ejecutivo.
