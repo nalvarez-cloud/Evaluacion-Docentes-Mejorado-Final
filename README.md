@@ -78,7 +78,7 @@ Descarga de resultados
 ```
 ## Arquitectura general del sistema
 
-![Pipeline](imagenes/pipeline_modelo.png)
+![Pipeline](imagenes/pipeline_modelo.png.jpeg)
 
 ---
 
